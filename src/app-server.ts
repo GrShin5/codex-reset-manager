@@ -106,8 +106,10 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
     try {
       this.initializeResult = await this.request("initialize", {
         clientInfo: {
+          // Keep in step with package.json; the App Server echoes this back
+          // in its user agent, so a stale value misreports the client.
           name: "codex-reset-manager",
-          version: "0.1.0",
+          version: "0.2.0",
         },
         capabilities: {
           optOutNotificationMethods: ["item/agentMessage/delta", "item/reasoning/delta"],

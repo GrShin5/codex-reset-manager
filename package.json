@@ -1,6 +1,6 @@
 {
   "name": "codex-reset-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A guarded macOS monitor that anchors verified Codex usage-window resets with one isolated eligible model turn.",
   "keywords": [
     "codex",

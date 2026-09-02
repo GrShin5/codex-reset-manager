@@ -1,0 +1,35 @@
+{
+  "name": "codex-reset-manager",
+  "version": "0.1.0",
+  "description": "A guarded macOS monitor that anchors verified Codex usage-window resets with one isolated eligible model turn.",
+  "keywords": ["codex", "macos", "launchd", "usage-limits", "rate-limits", "cli"],
+  "homepage": "https://github.com/GrShin5/codex-reset-manager#readme",
+  "bugs": {
+    "url": "https://github.com/GrShin5/codex-reset-manager/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GrShin5/codex-reset-manager.git"
+  },
+  "license": "MIT",
+  "author": "GrShin5",
+  "type": "module",
+  "bin": {
+    "codex-reset-manager": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "start": "npm run build && node dist/src/cli.js",
+    "daemon": "npm run build && node dist/src/cli.js daemon"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin"],
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}

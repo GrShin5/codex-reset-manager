@@ -1,0 +1,31 @@
+# Build output and dependencies
+node_modules/
+dist/
+
+# Local secrets and credentials — never commit these
+.env
+.env.*
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime artifacts, in case CODEX_ANCHOR_HOME points inside a clone
+state.json
+config.json
+*.jsonl
+anchor-workspace/
+daemon.lock/
+anchor.lock/
+logs/
+*.log
+
+# Editor and OS junk
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local working notes
+notes/

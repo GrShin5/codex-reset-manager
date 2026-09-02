@@ -1,0 +1,387 @@
+#!/usr/bin/env node
+
+import { AppServerClient, formatAnchorRoute, selectLowestCostAnchorRoute } from "./app-server.js";
+import { AnchorExecutor } from "./anchor.js";
+import { resolveAppServerCommand, resolveCodexExecutable } from "./codex-command.js";
+import { anchorWorkspaceIsEmpty, ensureAppDirectories, loadConfig, loadState, saveState, tailFile } from "./files.js";
+import { installLaunchAgent, launchAgentInstalled, launchAgentRegistered, uninstallLaunchAgent } from "./launch-agent.js";
+import { Logger } from "./logger.js";
+import { ProcessLock } from "./lock.js";
+import { UsageMonitor } from "./monitor.js";
+import { notificationPermissionDiagnostic } from "./notify.js";
+import { resolveAppPaths } from "./paths.js";
+import { assertSupportedPlatform } from "./platform.js";
+import {
+  manualAnchorAllowsAutoAnchoring,
+  manualAnchorAllowsEnable,
+  nextScheduledWakeAt,
+  recordManualAnchor,
+  snapshotContainsTargetWindow,
+} from "./state-machine.js";
+import { formatWindow, isTargetWindowExposed, normalizeRateLimits } from "./windows.js";
+
+const usage = `Usage: codex-reset-manager <command>
+
+Commands:
+  doctor
+  install | uninstall
+  daemon
+  status | logs
+  enable | disable
+  verify-monitoring-cost [--reads=N]
+  test-anchor --confirm-consume-usage
+`;
+
+async function main(): Promise<void> {
+  const [command, ...argumentsList] = process.argv.slice(2);
+  if (command === undefined || command === "help" || command === "--help" || command === "-h") {
+    console.log(usage);
+    return;
+  }
+
+  assertSupportedPlatform();
+  const paths = resolveAppPaths();
+  await ensureAppDirectories(paths);
+  const config = await loadConfig(paths);
+  const logger = new Logger(paths, config);
+
+  switch (command) {
+    case "doctor":
+      await doctor(paths, logger);
+      return;
+    case "install":
+      await install(paths, logger);
+      return;
+    case "uninstall":
+      await uninstall(paths, logger);
+      return;
+    case "daemon":
+      await daemon(paths, config, logger);
+      return;
+    case "status":
+      await status(paths, config);
+      return;
+    case "logs":
+      await logs(paths);
+      return;
+    case "enable":
+      await enable(paths, logger);
+      return;
+    case "disable":
+      await disable(paths, logger);
+      return;
+    case "verify-monitoring-cost":
+      await verifyMonitoringCost(paths, logger, parseReads(argumentsList));
+      return;
+    case "test-anchor":
+      await testAnchor(paths, config, logger, argumentsList);
+      return;
+    default:
+      throw new Error(`Unknown command: ${command}\n\n${usage}`);
+  }
+}
+
+async function doctor(
+  paths: ReturnType<typeof resolveAppPaths>,
+  logger: Logger,
+): Promise<void> {
+  const codexExecutable = await requireCodexExecutable();
+  const client = new AppServerClient(logger, codexExecutable);
+  try {
+    await client.start();
+    const [account, models, rateLimits] = await Promise.all([
+      client.getAccount(),
+      client.listModels(),
+      client.readRateLimits(),
+    ]);
+    const snapshot = normalizeRateLimits(rateLimits);
+    const route = selectLowestCostAnchorRoute(models);
+    const workspaceEmpty = await anchorWorkspaceIsEmpty(paths);
+    const ephemeral = route !== null && workspaceEmpty ? await client.startEphemeralThread(paths.anchorWorkspace, route) : null;
+    const ephemeralValid = route !== null
+      && ephemeral?.ephemeral === true
+      && ephemeral.path === null
+      && typeof ephemeral.id === "string"
+      && ephemeral.id.length > 0
+      && ephemeral.model === route.model
+      && ephemeral.reasoningEffort === route.effort;
+    console.log("Codex Reset Manager doctor");
+    console.log(`  App Server: connected`);
+    console.log(`  Codex CLI executable: ${codexExecutable}`);
+    console.log(`  ChatGPT authentication: ${account.requiresOpenaiAuth === false ? "not required by current provider" : account.account?.type ?? "unknown"}`);
+    console.log(`  Lowest-cost eligible anchor route: ${route === null ? "unavailable (no known model with an advertised safe effort)" : formatAnchorRoute(route)}`);
+    console.log(`  Dedicated anchor workspace: ${workspaceEmpty ? "empty" : "not empty (anchor blocked)"}`);
+    console.log(`  Ephemeral thread (no model turn): ${ephemeralValid ? "confirmed" : "not confirmed"}`);
+    console.log(`  Target windows exposed: ${snapshotContainsTargetWindow(snapshot) ? "yes" : "no"}`);
+    console.log(`  5-hour window: ${exposureText(isTargetWindowExposed(snapshot, "five_hour"))}`);
+    console.log(`  Weekly window: ${exposureText(isTargetWindowExposed(snapshot, "weekly"))}`);
+    for (const window of snapshot.windows) {
+      console.log(`    ${formatWindow(window)}`);
+    }
+    console.log(`  Notifications: ${notificationPermissionDiagnostic()}`);
+    console.log("  Reminder: passive reads do not start a model turn in this client, but backend quota cost is not guaranteed by this tool.");
+  } finally {
+    await client.stop();
+  }
+}
+
+async function install(paths: ReturnType<typeof resolveAppPaths>, logger: Logger): Promise<void> {
+  const codexExecutable = await requireCodexExecutable();
+  const state = await loadState(paths);
+  // Installing or reinstalling the background process never carries an old
+  // opt-in forward. The user must explicitly enable it after installation.
+  state.autoAnchorEnabled = false;
+  await saveState(paths, state);
+  await installLaunchAgent(paths, codexExecutable);
+  await logger.info("launch_agent_installed");
+  console.log("LaunchAgent installed. Monitoring starts with automatic anchoring disabled until an eligible manual test and enable command.");
+}
+
+async function uninstall(paths: ReturnType<typeof resolveAppPaths>, logger: Logger): Promise<void> {
+  await uninstallLaunchAgent(paths);
+  await logger.info("launch_agent_uninstalled");
+  console.log("LaunchAgent removed. Application state and logs were preserved.");
+}
+
+async function daemon(
+  paths: ReturnType<typeof resolveAppPaths>,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: Logger,
+): Promise<void> {
+  const lock = new ProcessLock(paths.lockDirectory);
+  await lock.acquire();
+  const resolvedCommand = await resolveAppServerCommand();
+  if (resolvedCommand.recovered) {
+    await logger.warn("codex_executable_recovered", {
+      configured: resolvedCommand.configured,
+      command: resolvedCommand.command,
+    });
+  }
+  const client = new AppServerClient(logger, resolvedCommand.command);
+  const monitor = new UsageMonitor(client, paths, config, await loadState(paths), logger);
+  let stopping = false;
+  const stop = async (): Promise<void> => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    await logger.info("daemon_stopping");
+    await monitor.stop();
+    await lock.release();
+  };
+  process.once("SIGINT", () => void stop().then(() => process.exit(0)));
+  process.once("SIGTERM", () => void stop().then(() => process.exit(0)));
+  try {
+    await monitor.start();
+    await logger.info("daemon_started", { autoAnchorEnabled: monitor.getState().autoAnchorEnabled });
+    await new Promise<void>(() => undefined);
+  } finally {
+    await stop();
+  }
+}
+
+async function status(
+  paths: ReturnType<typeof resolveAppPaths>,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+): Promise<void> {
+  const state = await loadState(paths);
+  console.log("Codex Reset Manager status");
+  console.log(`  LaunchAgent plist present: ${await launchAgentInstalled(paths) ? "yes" : "no"}`);
+  console.log(`  LaunchAgent registered with launchd: ${await launchAgentRegistered() ? "yes" : "no"}`);
+  console.log(`  Automatic anchor: ${state.autoAnchorEnabled ? "enabled" : "disabled"}`);
+  console.log(`  Manual anchor validation: ${state.manualAnchor?.status ?? "not run"}`);
+  console.log(`  Manual safety and route check: ${manualSafetyText(state.manualAnchor)}`);
+  console.log(`  Manual reset advancement: ${manualResetText(state.manualAnchor)}`);
+  console.log(`  Manual anchor route: ${state.manualAnchor === null ? "not run" : state.manualAnchor.route === undefined || state.manualAnchor.route === null ? "not recorded (legacy result)" : formatAnchorRoute(state.manualAnchor.route)}`);
+  console.log(`  Manual adopted baselines: ${state.manualAnchor?.baselineWindowIds?.length ? state.manualAnchor.baselineWindowIds.join(", ") : "none"}`);
+  const eligibility = state.autoAnchorEnabled
+    ? `Automatic anchor scheduling eligible: ${manualAnchorAllowsAutoAnchoring(state) ? "yes" : "no"}`
+    : `Enable can be run now: ${manualAnchorAllowsEnable(state) ? "yes" : "no"}`;
+  console.log(`  ${eligibility}`);
+  const nextWakeAt = nextScheduledWakeAt(state, config);
+  console.log(`  Next reset evaluation: ${nextWakeAt === null ? "not established" : new Date(nextWakeAt).toLocaleString()}`);
+  const recordedFiveHour = Object.values(state.windows).some((window) => window.kind === "five_hour");
+  const recordedWeekly = Object.values(state.windows).some((window) => window.kind === "weekly");
+  console.log(`  Recorded 5-hour window: ${recordedExposureText(recordedFiveHour)}`);
+  console.log(`  Recorded weekly window: ${recordedExposureText(recordedWeekly)}`);
+  if (Object.keys(state.windows).length === 0) {
+    console.log("  Windows: none observed yet");
+  } else {
+    console.log("  Windows:");
+    for (const window of Object.values(state.windows).sort((left, right) => left.id.localeCompare(right.id))) {
+      const reset = window.resetsAt === null ? "unset" : new Date(window.resetsAt * 1_000).toLocaleString();
+      const verified = window.verifiedResetAt === null ? "not established" : new Date(window.verifiedResetAt * 1_000).toLocaleString();
+      const evidence = baselineEvidenceText(window.baselineEvidence, window.verifiedResetAt !== null);
+      const label = window.kind === "unknown" ? "unknown (not monitored)" : window.kind;
+      console.log(`    ${label}: used ${window.usedPercent ?? "unknown"}%, observed reset ${reset}, anchor baseline ${verified} (${evidence})`);
+    }
+  }
+  const recentAnchors = Object.values(state.anchors).sort((left, right) => right.claimedAt - left.claimedAt).slice(0, 8);
+  console.log(`  Recent anchor generations: ${recentAnchors.length}`);
+  for (const record of recentAnchors) {
+    const route = record.route === undefined || record.route === null ? "route not recorded" : formatAnchorRoute(record.route);
+    console.log(`    ${record.status} (${route}): ${record.detail}`);
+  }
+  const latestSkipped = recentAnchors.find((record) => record.status === "skipped");
+  if (latestSkipped !== undefined) {
+    console.log(`  Latest automatic decision: skipped — ${latestSkipped.detail}`);
+  }
+}
+
+async function logs(paths: ReturnType<typeof resolveAppPaths>): Promise<void> {
+  const events = await tailFile(`${paths.logsDirectory}/events.jsonl`);
+  console.log(events.length === 0 ? "No event logs yet." : events);
+}
+
+async function enable(paths: ReturnType<typeof resolveAppPaths>, logger: Logger): Promise<void> {
+  const state = await loadState(paths);
+  if (!manualAnchorAllowsEnable(state)) {
+    throw new Error("Automatic anchoring remains disabled until test-anchor --confirm-consume-usage produces a verified result or a ready result with an adopted future baseline.");
+  }
+  state.autoAnchorEnabled = true;
+  await saveState(paths, state);
+  await logger.info("auto_anchor_enabled");
+  const manual = state.manualAnchor;
+  if (manual === null) {
+    throw new Error("Automatic anchoring eligibility changed before it could be saved.");
+  }
+  const manualRoute = manual.route === undefined || manual.route === null
+    ? "a legacy route that was not recorded"
+    : formatAnchorRoute(manual.route);
+  const validation = manual.status === "ready"
+    ? "a safe manual completion with reset advancement pending"
+    : "a verified manual reset advancement";
+  console.log(`Automatic anchoring enabled. The manual test used ${manualRoute} and established ${validation}; each future anchor will select the lowest-cost eligible route currently advertised by App Server and use at most one turn per reset generation.`);
+}
+
+async function disable(paths: ReturnType<typeof resolveAppPaths>, logger: Logger): Promise<void> {
+  const state = await loadState(paths);
+  state.autoAnchorEnabled = false;
+  await saveState(paths, state);
+  await logger.info("auto_anchor_disabled");
+  console.log("Automatic anchoring disabled. Passive monitoring can continue.");
+}
+
+async function verifyMonitoringCost(paths: ReturnType<typeof resolveAppPaths>, logger: Logger, reads: number): Promise<void> {
+  const client = new AppServerClient(logger);
+  try {
+    await client.start();
+    const before = normalizeRateLimits(await client.readRateLimits());
+    for (let index = 0; index < reads; index += 1) {
+      await client.readRateLimits();
+    }
+    const after = normalizeRateLimits(await client.readRateLimits());
+    console.log("Monitoring-cost comparison (not a zero-cost guarantee)");
+    console.log(`  Passive reads executed: ${reads}`);
+    console.log("  Before:");
+    before.windows.forEach((window) => console.log(`    ${formatWindow(window)}`));
+    console.log("  After:");
+    after.windows.forEach((window) => console.log(`    ${formatWindow(window)}`));
+  } finally {
+    await client.stop();
+  }
+}
+
+async function testAnchor(
+  paths: ReturnType<typeof resolveAppPaths>,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: Logger,
+  argumentsList: string[],
+): Promise<void> {
+  if (!argumentsList.includes("--confirm-consume-usage")) {
+    throw new Error("test-anchor sends one real minimal Codex turn. Re-run with --confirm-consume-usage to continue.");
+  }
+  const client = new AppServerClient(logger);
+  try {
+    await client.start();
+    const result = await new AnchorExecutor(client, paths, config, logger).run();
+    const state = await loadState(paths);
+    const manual = recordManualAnchor(state, result);
+    await saveState(paths, state);
+    console.log("Manual anchor test");
+    console.log(`  Result: ${manual.status}`);
+    console.log(`  Safety and route validation: ${result.turnCompletedSafely ? "passed" : "not passed"}`);
+    console.log(`  Reset timestamp advancement: ${manualResetText(manual)}`);
+    const baselines = manual.baselineWindowIds ?? [];
+    console.log(`  Adopted anchor baselines: ${baselines.length > 0 ? baselines.join(", ") : "none"}`);
+    console.log(`  Automatic anchoring can be enabled: ${manualAnchorAllowsEnable(state) ? "yes" : "no"}`);
+    console.log(`  Selected route: ${result.route === null ? "not selected" : formatAnchorRoute(result.route)}`);
+    console.log(`  Detail: ${result.detail}`);
+    console.log(`  Ephemeral thread: ${result.threadId ?? "not created"}`);
+    console.log("  Before:");
+    result.before.windows.forEach((window) => console.log(`    ${formatWindow(window)}`));
+    if (result.after !== null) {
+      console.log("  After:");
+      result.after.windows.forEach((window) => console.log(`    ${formatWindow(window)}`));
+    }
+  } finally {
+    await client.stop();
+  }
+}
+
+async function requireCodexExecutable(): Promise<string> {
+  const executable = await resolveCodexExecutable();
+  if (executable === null) {
+    throw new Error("Codex CLI executable was not found on PATH. Install Codex CLI and run this command from a shell where `command -v codex` succeeds.");
+  }
+  return executable;
+}
+
+function exposureText(exposed: boolean): string {
+  return exposed ? "exposed" : "not exposed (normal; not monitored)";
+}
+
+function recordedExposureText(observed: boolean): string {
+  return observed ? "observed" : "not observed yet (normal; run doctor for a live check)";
+}
+
+function manualSafetyText(manual: Awaited<ReturnType<typeof loadState>>["manualAnchor"]): string {
+  return manual?.status === "verified" || manual?.status === "ready" ? "passed" : "not passed";
+}
+
+function manualResetText(manual: Awaited<ReturnType<typeof loadState>>["manualAnchor"]): string {
+  if (manual?.status === "verified") {
+    return "verified";
+  }
+  if (manual?.status === "ready") {
+    return "pending first automatic anchor";
+  }
+  return "not verified";
+}
+
+function baselineEvidenceText(
+  evidence: Awaited<ReturnType<typeof loadState>>["windows"][string]["baselineEvidence"],
+  established: boolean,
+): string {
+  if (!established) {
+    return "none";
+  }
+  switch (evidence) {
+    case "manual_ready":
+      return "adopted after safe manual test";
+    case "external_usage":
+      return "re-baselined after external use was observed";
+    case "recovered_rollover":
+      return "re-baselined from a legacy or ambiguous rollover (no catch-up turn)";
+    case "verified_advance":
+    default:
+      return "strictly verified reset advancement";
+  }
+}
+
+function parseReads(argumentsList: string[]): number {
+  const argument = argumentsList.find((value) => value.startsWith("--reads="));
+  if (argument === undefined) {
+    return 20;
+  }
+  const count = Number(argument.slice("--reads=".length));
+  if (!Number.isInteger(count) || count < 1 || count > 100) {
+    throw new Error("--reads must be an integer from 1 to 100.");
+  }
+  return count;
+}
+
+void main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : "Unexpected failure.");
+  process.exitCode = 1;
+});

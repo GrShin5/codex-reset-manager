@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -10,7 +10,14 @@ import { resolveAppPaths } from "../src/paths.js";
 import type { ManagerState } from "../src/types.js";
 
 const fakeAppServer = `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+
+// doctor now asks for the CLI version before connecting.
+if (process.argv.includes("--version")) {
+  console.log("codex-cli " + (process.env.FAKE_CLI_VERSION ?? "0.152.0"));
+  process.exit(0);
+}
 
 const input = createInterface({ input: process.stdin });
 let rateLimitReads = 0;
@@ -44,6 +51,13 @@ function hasTurnSafety(params) {
 
 for await (const line of input) {
   const request = JSON.parse(line);
+  // Notifications carry no id and expect no reply. Without this the fake
+  // would reject \`initialized\`, and because the client cannot match an
+  // id-less error to a request, the test would pass while hiding it.
+  if (process.env.FAKE_TRACE_FILE) {
+    appendFileSync(process.env.FAKE_TRACE_FILE, (request.method ?? "?") + "\\n");
+  }
+  if (request.id === undefined) continue;
   if (request.method === "initialize") {
     reply(request.id, {});
   } else if (request.method === "account/read") {
@@ -122,7 +136,10 @@ async function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<CommandRe
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error(`CLI timed out: ${args.join(" ")}`));
-    }, 20_000);
+      // Anchoring samples the rate limits across the full configured span
+      // after the turn (pinned to 4 samples / 15s = ~50s per test-anchor), so
+      // a CLI run legitimately takes far longer than it used to.
+    }, 180_000);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -144,16 +161,32 @@ test("a verified fallback manual anchor enables automatic anchoring", { skip: pr
   const root = await mkdtemp(join(tmpdir(), "codex-cli-fallback-test-"));
   const fakeCodex = join(root, "fake-codex.mjs");
   await writeFile(fakeCodex, fakeAppServer, { mode: 0o755 });
+  // A CODEX_HOME with no config.toml exercises the unreadable-config branch;
+  // a fixture below covers the configured-servers branch.
+  const codexHome = join(root, "codex-home");
+  await mkdir(codexHome, { recursive: true });
   const env = {
     ...process.env,
     CODEX_ANCHOR_HOME: root,
     CODEX_RESET_MANAGER_CODEX: fakeCodex,
+    CODEX_HOME: codexHome,
   };
 
   const doctor = await runCli(["doctor"], env);
   assert.equal(doctor.code, 0, doctor.stderr);
   assert.match(doctor.stdout, /Lowest-cost eligible anchor route: gpt-5\.4-mini \/ none/);
   assert.match(doctor.stdout, /Ephemeral thread \(no model turn\): confirmed/);
+  assert.match(doctor.stdout, /Codex CLI version: 0\.152\.0 \(in the tested set\)/);
+  assert.match(doctor.stdout, /MCP servers in .*config\.toml: config\.toml not readable/);
+
+  // An unrecognised version must warn without blocking: doctor still exits 0.
+  await writeFile(join(codexHome, "config.toml"), '[mcp_servers.filesystem]\ncommand = "node"\n[mcp_servers.filesystem.env]\nA = "1"\n', "utf8");
+  const untested = await runCli(["doctor"], { ...env, FAKE_CLI_VERSION: "0.999.0" });
+  assert.equal(untested.code, 0, untested.stderr);
+  assert.match(untested.stdout, /Codex CLI version: 0\.999\.0 \(WARNING: not in the tested set/);
+  assert.match(untested.stdout, /automatic anchoring is NOT blocked/);
+  // The subtable [mcp_servers.filesystem.env] must not count as a second server.
+  assert.match(untested.stdout, /MCP servers in .*config\.toml: 1 configured \(filesystem\)/);
 
   const manual = await runCli(["test-anchor", "--confirm-consume-usage"], env);
   assert.equal(manual.code, 0, manual.stderr);
@@ -230,4 +263,60 @@ test("an unverified manual anchor cannot enable automatic anchoring", { skip: pr
   const enable = await runCli(["enable"], env);
   assert.equal(enable.code, 1);
   assert.match(enable.stderr, /verified result or a ready result with an adopted future baseline/);
+});
+
+/**
+ * verify-protocol exists because unit tests can only ever be as correct as our
+ * belief about the wire contract. Its defining property is that it starts no
+ * model turn, so that is what this pins.
+ */
+test("verify-protocol reports the handshake and starts no model turn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-cli-verify-protocol-test-"));
+  const fakeCodex = join(root, "fake-codex.mjs");
+  const tracePath = join(root, "trace.txt");
+  await writeFile(fakeCodex, fakeAppServer, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    CODEX_ANCHOR_HOME: root,
+    CODEX_RESET_MANAGER_CODEX: fakeCodex,
+    FAKE_TRACE_FILE: tracePath,
+  };
+
+  const result = await runCli(["verify-protocol"], env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /initialize: ok/);
+  assert.match(result.stdout, /initialized: sent/);
+  assert.match(result.stdout, /account\/rateLimits\/read: 1 window/);
+  assert.match(result.stdout, /unmatched error responses: none/);
+  assert.match(result.stdout, /turn\/start issued: no/);
+  assert.match(result.stdout, /Protocol verification passed\./);
+  assert.match(result.stdout, /thread\/start: skipped/);
+
+  const seen = (await readFile(tracePath, "utf8")).split("\n").filter((line) => line.length > 0);
+  assert.equal(seen[0], "initialize");
+  assert.equal(seen[1], "initialized");
+  assert.ok(!seen.includes("turn/start"), "verify-protocol must never start a turn");
+  assert.ok(!seen.includes("thread/start"), "thread/start requires --allow-thread-start");
+});
+
+test("verify-protocol starts one ephemeral thread only when explicitly allowed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-cli-verify-thread-test-"));
+  const fakeCodex = join(root, "fake-codex.mjs");
+  const tracePath = join(root, "trace.txt");
+  await writeFile(fakeCodex, fakeAppServer, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    CODEX_ANCHOR_HOME: root,
+    CODEX_RESET_MANAGER_CODEX: fakeCodex,
+    FAKE_TRACE_FILE: tracePath,
+  };
+
+  const result = await runCli(["verify-protocol", "--allow-thread-start"], env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /thread\/start: ephemeral thread confirmed/);
+  assert.match(result.stdout, /turn\/start issued: no/);
+
+  const seen = (await readFile(tracePath, "utf8")).split("\n").filter((line) => line.length > 0);
+  assert.equal(seen.filter((method) => method === "thread/start").length, 1);
+  assert.ok(!seen.includes("turn/start"), "even with a thread, no turn may start");
 });

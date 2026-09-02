@@ -46,6 +46,9 @@ export interface CodexAppServer {
   onNotification(listener: (method: string, params: unknown) => void): () => void;
 }
 
+/** Bounds the diagnostic buffer that only verify-protocol ever drains. */
+const MAX_RETAINED_UNMATCHED_ERRORS = 32;
+
 export class RpcRequestError extends Error {
   public constructor(
     public readonly method: string,
@@ -68,6 +71,8 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private started = false;
+  private initializeResult: unknown = null;
+  private readonly unmatchedErrors: Array<{ code: number; message: string }> = [];
 
   public constructor(
     private readonly logger: Logger,
@@ -99,7 +104,7 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
     reader.on("close", () => this.handleExit("stdout_closed"));
 
     try {
-      await this.request("initialize", {
+      this.initializeResult = await this.request("initialize", {
         clientInfo: {
           name: "codex-reset-manager",
           version: "0.1.0",
@@ -108,12 +113,31 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
           optOutNotificationMethods: ["item/agentMessage/delta", "item/reasoning/delta"],
         },
       });
+      // The documented App Server lifecycle is initialize -> initialized ->
+      // ordinary RPC. Codex 0.152.0 does not appear to enforce the middle
+      // step for this surface (only the exec-server rejects RPCs sent before
+      // it), so this is protocol hygiene rather than a fix for a live fault.
+      // It is sent before `started` so no other request can precede it.
+      try {
+        this.notify("initialized");
+      } catch {
+        // Best-effort. The connection is already established and usable, and
+        // the child can legitimately disappear between the initialize reply
+        // and this line. Discarding a working connection over a hygiene
+        // notification would be a worse outcome than skipping it.
+        void this.logger.warn("app_server_initialized_notify_failed");
+      }
       this.started = true;
       await this.logger.info("app_server_connected");
     } catch (error: unknown) {
       await this.stop();
       throw error;
     }
+  }
+
+  /** The `initialize` result, for diagnostics. Null before start() succeeds. */
+  public getInitializeResult(): unknown {
+    return this.initializeResult;
   }
 
   public async stop(): Promise<void> {
@@ -257,6 +281,18 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
     return response;
   }
 
+  /**
+   * A JSON-RPC notification: same framing as a request but with no `id`, so
+   * there is no reply to wait for and no pending entry to register.
+   */
+  private notify(method: string, params?: unknown): void {
+    const child = this.child;
+    if (child?.stdin === null || child?.stdin === undefined || child.killed) {
+      throw new Error("Codex App Server is not running.");
+    }
+    child.stdin.write(`${JSON.stringify({ method, ...(params === undefined ? {} : { params }) })}\n`);
+  }
+
   private handleLine(line: string): void {
     let message: JsonRpcResponse;
     try {
@@ -270,10 +306,17 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
       return;
     }
     if (typeof message.id !== "number") {
+      // A reply that matches no request we can identify. This is the only
+      // place a server's rejection of a notification (such as `initialized`,
+      // which carries no id) could ever surface, so record it rather than
+      // dropping it silently. The message is still not actionable, so the
+      // behaviour is unchanged: it is reported, not raised.
+      this.reportUnmatchedResponse(message);
       return;
     }
     const pending = this.pending.get(message.id);
     if (pending === undefined) {
+      this.reportUnmatchedResponse(message);
       return;
     }
     this.pending.delete(message.id);
@@ -283,6 +326,28 @@ export class AppServerClient extends EventEmitter implements CodexAppServer {
       return;
     }
     pending.resolve(message.result);
+  }
+
+  private reportUnmatchedResponse(message: JsonRpcResponse): void {
+    if (message.error === undefined) {
+      return;
+    }
+    // Only verify-protocol drains this, so in the daemon it is never read.
+    // Keep a bounded window of the most recent entries rather than letting a
+    // chatty server grow it without limit over a long-lived run.
+    if (this.unmatchedErrors.length >= MAX_RETAINED_UNMATCHED_ERRORS) {
+      this.unmatchedErrors.shift();
+    }
+    this.unmatchedErrors.push({ code: message.error.code, message: message.error.message });
+    void this.logger.warn("app_server_unmatched_error_response", { code: message.error.code });
+  }
+
+  /**
+   * Errors that arrived with no matching request. Used by verify-protocol to
+   * prove that the server did not reject a notification we sent.
+   */
+  public takeUnmatchedErrors(): Array<{ code: number; message: string }> {
+    return this.unmatchedErrors.splice(0, this.unmatchedErrors.length);
   }
 
   private handleExit(reason: string): void {

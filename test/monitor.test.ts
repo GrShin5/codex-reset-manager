@@ -85,7 +85,7 @@ test("coalesces simultaneous zero-use 5-hour and weekly rollovers into one selec
   const state = automaticState(before);
   await saveState(paths, state);
   const client = new FakeAppServer([zero, zero, zero, after]);
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const notifications: Array<{ title: string; message: string }> = [];
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), recordingNotifier(notifications));
   try {
@@ -110,7 +110,7 @@ test("a ready manual baseline also requires a zero-use post-reset snapshot befor
   const state = automaticState(fixtures.before, true);
   await saveState(paths, state);
   const client = new FakeAppServer([fixtures.zero, fixtures.zero, fixtures.zero, fixtures.after]);
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -129,7 +129,7 @@ test("positive new-window usage is recorded as skipped and never starts a thread
   const state = automaticState(fixtures.before);
   await saveState(paths, state);
   const client = new FakeAppServer([fixtures.positive]);
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -152,7 +152,7 @@ test("a preflight re-check cancels when external usage appears during coalescing
   const state = automaticState(fixtures.before);
   await saveState(paths, state);
   const client = new FakeAppServer([fixtures.zero, fixtures.positive]);
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0.05, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0.05, verificationDelaySeconds: 0 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -175,7 +175,7 @@ test("weekly-only zero-use rollover selects the lowest available fallback route"
   await saveState(paths, state);
   const client = new FakeAppServer([zero, zero, zero, after]);
   client.models = [{ slug: "gpt-5.4-mini", supportedReasoningEfforts: ["none", "medium"] }];
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -196,7 +196,7 @@ test("preserves existing tool and route safety guards after a zero-use candidate
   await saveState(paths, state);
   const client = new FakeAppServer([fixtures.zero, fixtures.zero, fixtures.zero]);
   client.emitToolItem = true;
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const notifications: Array<{ title: string; message: string }> = [];
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), recordingNotifier(notifications));
   try {
@@ -216,7 +216,7 @@ test("no advertised route still rejects before thread/start or turn/start", asyn
   await saveState(paths, state);
   const client = new FakeAppServer([fixtures.zero, fixtures.zero, fixtures.zero]);
   client.models = [];
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -234,7 +234,7 @@ test("a persisted verified result prevents a second turn after restart", async (
   const fixtures = fiveHourRollover();
   const state = automaticState(fixtures.before);
   await saveState(paths, state);
-  const config = { ...DEFAULT_CONFIG, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
   const first = new FakeAppServer([fixtures.zero, fixtures.zero, fixtures.zero, fixtures.after]);
   const monitor = new UsageMonitor(first, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
@@ -265,7 +265,7 @@ test("sparse notifications and transient read failures remain passive and recove
   const second = rateLimits({ usedPercent: 5, duration: 300, resetsAt: 1_000 });
   const client = new FakeAppServer([first, second]);
   client.readFailuresRemaining = 1;
-  const config = { ...DEFAULT_CONFIG, pollIntervalSeconds: 0.01 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, pollIntervalSeconds: 0.01 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   try {
     await monitor.start();
@@ -285,7 +285,7 @@ test("a corrupt state file does not create an unhandled rejection", async () => 
   await writeFile(paths.stateFile, "{", "utf8");
   const state = emptyState();
   const client = new FakeAppServer([rateLimits({ usedPercent: 4, duration: 300, resetsAt: 1_000 })]);
-  const config = { ...DEFAULT_CONFIG, pollIntervalSeconds: 60 };
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0, pollIntervalSeconds: 60 };
   const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), silentNotifier);
   const rejections: unknown[] = [];
   const onRejection = (reason: unknown): void => { rejections.push(reason); };
@@ -297,6 +297,55 @@ test("a corrupt state file does not create an unhandled rejection", async () => 
     assert.ok(client.readCalls >= 1);
   } finally {
     process.off("unhandledRejection", onRejection);
+    await monitor.stop();
+  }
+});
+
+/**
+ * The structural safety claim for sliding windows, pinned end to end.
+ *
+ * When a window's reset timestamp tracks the clock, the anchor cannot verify
+ * it. The daemon must then do exactly two things: record the generation as
+ * unverified, and re-baseline onto the observed boundary so it neither retries
+ * the same generation nor gets stuck. One turn per cycle, no loop, no stall.
+ */
+test("a sliding reset timestamp yields one unverified turn, with no retry loop and no stall", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-monitor-sliding-"));
+  const paths = resolveAppPaths(root);
+  const baseline = Math.floor(Date.now() / 1_000) - 10;
+  const before = rateLimits({ usedPercent: 55, duration: 10_080, resetsAt: baseline });
+  // Every read recomputes resetsAt as roughly now + 7 days.
+  const sliding = (offset: number) => rateLimits({ usedPercent: 0, duration: 10_080, resetsAt: baseline + 604_800 + offset });
+  const state = automaticState(before);
+  await saveState(paths, state);
+  const client = new FakeAppServer([
+    sliding(0), sliding(1), sliding(2), sliding(3), sliding(4), sliding(5), sliding(6), sliding(7),
+  ]);
+  const config = { ...DEFAULT_CONFIG, verificationSampleIntervalSeconds: 0.02, resetGraceSeconds: 0, coalesceSeconds: 0, verificationDelaySeconds: 0 };
+  const notifications: Array<{ title: string; message: string }> = [];
+  const monitor = new UsageMonitor(client, paths, config, state, new Logger(paths, config), recordingNotifier(notifications));
+  try {
+    await monitor.start();
+    await waitUntil(() => client.turnCalls === 1
+      && Object.values(monitor.getState().anchors).some((record) => record.status === "unverified"));
+
+    const windowId = "codex:primary:10080";
+    assert.equal(client.turnCalls, 1);
+    const records = Object.values(monitor.getState().anchors);
+    assert.equal(records.length, 1, "exactly one generation was claimed");
+    assert.equal(records[0]?.status, "unverified");
+    assert.deepEqual(notifications, [], "an unverified anchor must stay silent");
+
+    // Re-baselined onto the observed boundary, without claiming it was anchored.
+    const tracked = monitor.getState().windows[windowId];
+    assert.equal(tracked?.baselineEvidence, "recovered_rollover");
+    assert.notEqual(tracked?.verifiedResetAt, null);
+
+    // Further polls must not produce a second turn for the same cycle.
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    assert.equal(client.turnCalls, 1, "no retry loop");
+    assert.equal(Object.values(monitor.getState().anchors).length, 1, "no extra generations");
+  } finally {
     await monitor.stop();
   }
 });

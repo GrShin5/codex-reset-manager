@@ -275,7 +275,9 @@ export function applyAnchorResult(
     const windowVerified = result.status === "verified" && advanced.has(candidate.windowId);
     record.status = result.status === "verified" && !windowVerified ? "unverified" : result.status;
     record.detail = result.status === "verified" && !windowVerified
-      ? "The coalesced turn advanced another window; this window's reset timestamp did not advance."
+      ? result.verificationVerdicts?.[candidate.windowId] === "sliding"
+        ? "The coalesced turn advanced another window; this window's reset timestamp kept sliding with wall-clock time."
+        : "The coalesced turn advanced another window; this window's reset timestamp did not advance."
       : result.detail;
     record.completedAt = completedAt;
     record.route = result.route;
@@ -294,7 +296,8 @@ export function applyAnchorResult(
 }
 
 export function recordManualAnchor(state: ManagerState, result: AnchorRunResult): NonNullable<ManagerState["manualAnchor"]> {
-  const baselineWindowIds = adoptManualBaselines(state, result);
+  const refusedWindowIds: string[] = [];
+  const baselineWindowIds = adoptManualBaselines(state, result, refusedWindowIds);
   const status = result.status === "verified"
     ? "verified"
     : result.turnCompletedSafely && baselineWindowIds.length > 0
@@ -309,6 +312,9 @@ export function recordManualAnchor(state: ManagerState, result: AnchorRunResult)
     detail,
     route: result.route,
     baselineWindowIds,
+    // Recorded so status can explain why a window is not being scheduled,
+    // instead of leaving it silently absent from the adopted list.
+    ...(refusedWindowIds.length > 0 ? { refusedWindowIds } : {}),
   } as const;
   state.manualAnchor = manual;
   return manual;
@@ -364,12 +370,39 @@ function trackWindow(window: NormalizedWindow, observedAt: number, previous: Tra
   };
 }
 
-function adoptManualBaselines(state: ManagerState, result: AnchorRunResult): string[] {
+function adoptManualBaselines(
+  state: ManagerState,
+  result: AnchorRunResult,
+  refused: string[] = [],
+): string[] {
   if (!result.turnCompletedSafely || result.after === null) {
     return [];
   }
   const adopted: string[] = [];
   for (const windowId of result.targetWindowIds) {
+    // Only adopt a boundary the samples actually proved to be steady.
+    //
+    // This is an allow-list on purpose. Denying just "sliding" is not enough:
+    // a genuinely sliding window lands on "indeterminate" whenever the series
+    // is non-monotonic, or whenever RPC latency stretches the observation
+    // window so the drift no longer clears the elapsed-time threshold. Both
+    // are routine. Adopting either would let the monitor schedule against a
+    // value that moves away as fast as the clock, so its boundary would never
+    // arrive and the window would never be anchored again.
+    //
+    // The evidence label alone could never have prevented this:
+    // hasStoredBaseline gates on verifiedResetAt and never reads
+    // baselineEvidence. The adoption itself has to be refused.
+    //
+    // Both allowed verdicts come from the same proven-stable branch of the
+    // classifier. verificationVerdicts is always present here, because the
+    // only site that sets turnCompletedSafely also sets it, and this function
+    // has already returned for runs where that flag is false.
+    const verdict = result.verificationVerdicts?.[windowId];
+    if (verdict !== "advanced_stable" && verdict !== "not_advanced") {
+      refused.push(windowId);
+      continue;
+    }
     const beforeWindow = result.before.windows.find((candidate) => candidate.id === windowId);
     const afterWindow = result.after.windows.find((candidate) => candidate.id === windowId);
     if (beforeWindow === undefined || afterWindow === undefined || !sameAnchorWindow(beforeWindow, afterWindow)) {
@@ -383,7 +416,7 @@ function adoptManualBaselines(state: ManagerState, result: AnchorRunResult): str
     }
     const tracked = state.windows[windowId] ?? trackWindow(afterWindow, result.after.observedAt, undefined);
     tracked.verifiedResetAt = afterWindow.resetsAt;
-    tracked.baselineEvidence = beforeWindow.resetsAt !== null && afterWindow.resetsAt > beforeWindow.resetsAt
+    tracked.baselineEvidence = result.verifiedWindowIds.includes(windowId)
       ? "verified_advance"
       : "manual_ready";
     tracked.lastAnchorGeneration = "manual";

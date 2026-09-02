@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,4 +21,19 @@ test("redacts prompt-like data and rotates JSONL event logs", async () => {
   const allLogs = await Promise.all(files.map((file) => readFile(join(paths.logsDirectory, file), "utf8")));
   assert.doesNotMatch(allLogs.join("\n"), /private user content|also private/);
   assert.match(allLogs.join("\n"), /\[redacted\]/);
+});
+
+/**
+ * The event log is low-sensitivity by design (see the redaction in Logger),
+ * but it records this account's usage-window timing, so it is created
+ * owner-only rather than relying on the process umask.
+ */
+test("creates the event log owner-readable only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-logger-mode-test-"));
+  const paths = resolveAppPaths(root);
+  await ensureAppDirectories(paths);
+  const logger = new Logger(paths, DEFAULT_CONFIG);
+  await logger.info("first");
+  const events = await stat(join(paths.logsDirectory, "events.jsonl"));
+  assert.equal(events.mode & 0o777, 0o600);
 });

@@ -128,6 +128,11 @@ export interface ManualAnchorResult {
   route?: AnchorRoute | null;
   /** Optional so old verified state remains valid without a migration. */
   baselineWindowIds?: string[];
+  /**
+   * Target windows the samples could not prove steady, so they were refused as
+   * scheduling baselines. Recorded only so the operator can see why.
+   */
+  refusedWindowIds?: string[];
 }
 
 export interface ManagerState {
@@ -145,6 +150,9 @@ export interface ManagerConfig {
   resetGraceSeconds: number;
   coalesceSeconds: number;
   verificationDelaySeconds: number;
+  /** Post-turn rate-limit samples used to decide whether a window is anchored. */
+  verificationSampleCount: number;
+  verificationSampleIntervalSeconds: number;
   rollbackThresholdPercent: number;
   logFileMaxBytes: number;
   logFilesToKeep: number;
@@ -162,6 +170,16 @@ export interface AppPaths {
   stdoutLog: string;
   stderrLog: string;
 }
+
+/**
+ * How a target window behaved across the post-turn samples.
+ *
+ * `sliding` is the case that matters: an uninitialized window can report
+ * `resetsAt` as roughly `now + duration`, recomputed on every read, so its
+ * timestamp "advances" purely because the clock moved. Only `advanced_stable`
+ * is treated as verified; everything else fails closed.
+ */
+export type AnchorWindowVerdict = "advanced_stable" | "not_advanced" | "sliding" | "indeterminate";
 
 export interface AnchorRunResult {
   status: "verified" | "unverified" | "safety_abort" | "rejected";
@@ -181,6 +199,8 @@ export interface AnchorRunResult {
   turnCompletedSafely: boolean;
   /** Target windows whose future reset timestamp strictly advanced. Empty unless status is "verified". */
   verifiedWindowIds: string[];
+  /** Per-target-window sampling verdict. Optional: rejected runs never sample. */
+  verificationVerdicts?: Record<string, AnchorWindowVerdict>;
 }
 
 export const DEFAULT_CONFIG: ManagerConfig = {
@@ -189,6 +209,8 @@ export const DEFAULT_CONFIG: ManagerConfig = {
   resetGraceSeconds: 5,
   coalesceSeconds: 30,
   verificationDelaySeconds: 5,
+  verificationSampleCount: 4,
+  verificationSampleIntervalSeconds: 15,
   rollbackThresholdPercent: 5,
   logFileMaxBytes: 1_000_000,
   logFilesToKeep: 5,

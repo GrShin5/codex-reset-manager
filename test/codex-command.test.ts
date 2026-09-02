@@ -8,7 +8,10 @@ import {
   appServerCommandFromEnvironment,
   appServerSpawnEnvironment,
   CODEX_COMMAND_ENV,
+  codexVersionDiagnostic,
+  parseCodexCliVersion,
   resolveCodexExecutable,
+  TESTED_CODEX_CLI_VERSIONS,
 } from "../src/codex-command.js";
 
 test("uses the LaunchAgent-provided absolute Codex CLI path when present", () => {
@@ -44,4 +47,26 @@ test("resolves an executable Codex CLI from the interactive shell PATH", async (
     await resolveCodexExecutable({ PATH: "/missing", [CODEX_COMMAND_ENV]: executable }),
     executable,
   );
+});
+
+test("reads the version out of codex --version output", () => {
+  assert.equal(parseCodexCliVersion("codex-cli 0.152.0\n"), "0.152.0");
+  assert.equal(parseCodexCliVersion("codex-cli 0.153.0-alpha.1"), "0.153.0-alpha.1");
+  assert.equal(parseCodexCliVersion("something else entirely"), null);
+  assert.equal(parseCodexCliVersion(""), null);
+});
+
+/**
+ * An unrecognised Codex version must produce a warning and nothing else. The
+ * App Server protocol moves faster than this tool can be revalidated, so a
+ * hard version gate would break a working installation on every upgrade.
+ */
+test("warns about an untested Codex version without implying a block", () => {
+  const tested = TESTED_CODEX_CLI_VERSIONS[0]!;
+  assert.equal(codexVersionDiagnostic(tested), `${tested} (in the tested set)`);
+  assert.match(codexVersionDiagnostic(null), /^unknown \(could not run/);
+
+  const untested = codexVersionDiagnostic("0.999.0");
+  assert.match(untested, /WARNING: not in the tested set/);
+  assert.match(untested, /automatic anchoring is NOT blocked/);
 });

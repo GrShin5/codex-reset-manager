@@ -167,6 +167,7 @@ Codex CLIパスを変更する必要がある場合だけ <code>install</code> �
 node dist/src/cli.js status
 node dist/src/cli.js logs
 node dist/src/cli.js verify-monitoring-cost --reads=20
+node dist/src/cli.js verify-protocol
 launchctl print gui/$(id -u)/com.codex-reset-manager
 ~~~
 
@@ -194,6 +195,14 @@ launchctl print gui/$(id -u)/com.codex-reset-manager
   <code>rejected</code>、<code>skipped</code> は安全側の非成功結果です。同じreset
   世代への再試行は行いません。後のresetも、完全で適時のスナップショットが次のcycleの
   Usage 0%を証明できる場合だけ候補になります。
+- <code>verify-protocol</code> は実際にインストールされているCodex CLIに対して、
+  handshake、<code>account/read</code>、<code>model/list</code>、
+  <code>account/rateLimits/read</code> を確認します。モデルターンは開始しません。
+  <code>--stability-seconds=N</code> を付けると、windowのreset時刻が固定されているか
+  時計と一緒にずれているかを実測できます。<code>--allow-thread-start</code> を明示
+  した場合のみ ephemeral thread を1つ作成します（設定済みMCPサーバーが初期化される
+  可能性があります）。単体テストはプロトコルに対するこちらの理解以上には正しくなり得ない
+  ため、Codex更新後はこのコマンドで確認してください。
 - <code>verify-monitoring-cost</code> はpassive read前後の状態を比較します。この
   クライアント経路がモデルターンを開始しない補助確認であり、バックエンドUsageが
   絶対ゼロとは主張しません。

@@ -48,7 +48,7 @@ export class Logger {
         event,
         ...(details === undefined ? {} : { details: redact(details) as Record<string, unknown> }),
       };
-      await appendFile(this.eventLog, `${JSON.stringify(record)}\n`, "utf8");
+      await appendFile(this.eventLog, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
     } catch {
       // Logging must never stop monitoring or cause a second anchor attempt.
     }

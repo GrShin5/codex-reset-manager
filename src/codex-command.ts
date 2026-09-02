@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -111,4 +112,75 @@ export async function isExecutableFile(path: string): Promise<boolean> {
 
 function uniquePathEntries(entries: Array<string | null>): string[] {
   return [...new Set(entries.filter((entry): entry is string => entry !== null && entry.length > 0))];
+}
+
+/**
+ * Codex CLI versions this manager's wire usage has actually been checked
+ * against. An unlisted version is reported, never blocked: the App Server
+ * protocol moves faster than this tool can be revalidated, and refusing to
+ * anchor on an unrecognised version would break a working installation on
+ * every Codex upgrade.
+ */
+export const TESTED_CODEX_CLI_VERSIONS = ["0.152.0"] as const;
+
+/** Null when the executable could not be run or its output was unrecognised. */
+export async function readCodexCliVersion(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+  timeoutMs = 10_000,
+): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    let settled = false;
+    const finish = (value: string | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      // A wrapper script that ignores SIGTERM would otherwise be orphaned.
+      const escalation = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      escalation.unref();
+      resolve(value);
+    };
+    let timer: NodeJS.Timeout;
+    try {
+      child = spawn(command, ["--version"], {
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        env: appServerSpawnEnvironment(command, env),
+      });
+    } catch {
+      // The documented contract is null on failure, not a rejection: doctor
+      // reads this inside a Promise.all and must not exit non-zero over it.
+      resolve(null);
+      return;
+    }
+    timer = setTimeout(() => finish(null), timeoutMs);
+    let output = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      // A runaway --version must not be allowed to balloon memory.
+      if (output.length < 4_096) {
+        output += chunk.toString("utf8");
+      }
+    });
+    child.once("error", () => finish(null));
+    child.once("close", () => finish(parseCodexCliVersion(output)));
+  });
+}
+
+export function parseCodexCliVersion(output: string): string | null {
+  return /codex-cli\s+(\S+)/.exec(output)?.[1] ?? null;
+}
+
+export function codexVersionDiagnostic(version: string | null): string {
+  if (version === null) {
+    return "unknown (could not run codex --version)";
+  }
+  if ((TESTED_CODEX_CLI_VERSIONS as readonly string[]).includes(version)) {
+    return `${version} (in the tested set)`;
+  }
+  return `${version} (WARNING: not in the tested set [${TESTED_CODEX_CLI_VERSIONS.join(", ")}]; `
+    + "automatic anchoring is NOT blocked. Run verify-protocol to check the wire contract.)";
 }

@@ -3,7 +3,7 @@ import type { CodexAppServer } from "./app-server.js";
 import { anchorWorkspaceIsEmpty } from "./files.js";
 import type { Logger } from "./logger.js";
 import { ProcessLock } from "./lock.js";
-import type { AnchorRoute, AppPaths, AnchorRunResult, ManagerConfig, NormalizedSnapshot } from "./types.js";
+import type { AnchorRoute, AnchorWindowVerdict, AppPaths, AnchorRunResult, ManagerConfig, NormalizedSnapshot } from "./types.js";
 import { normalizeRateLimits } from "./windows.js";
 
 const TURN_TIMEOUT_MS = 90_000;
@@ -261,15 +261,38 @@ export class AnchorExecutor {
       };
     }
 
-    await delay(this.config.verificationDelaySeconds * 1_000);
-    const after = normalizeRateLimits(await this.client.readRateLimits());
-    const verifiedWindowIds = advancedTargetResetWindowIds(before, after, effectiveTargetWindowIds);
+    const samples = await this.sampleAfterTurn();
+    const after = samples[samples.length - 1];
+    if (after === undefined) {
+      // sampleAfterTurn rethrows a first-read failure, so this is only
+      // reachable via a malformed sample count. Fail loudly rather than
+      // dereferencing nothing after a turn has already been spent.
+      throw new Error("No post-turn rate-limit sample was taken.");
+    }
+    const classification = classifyVerificationSamples(
+      before,
+      samples,
+      effectiveTargetWindowIds,
+      Date.now(),
+      minimumStabilitySpanMs(this.config),
+    );
+    const verifiedWindowIds = classification.verifiedWindowIds;
     const verified = verifiedWindowIds.length > 0;
+    const slidingWindowIds = Object.entries(classification.verdicts)
+      .filter(([, verdict]) => verdict === "sliding")
+      .map(([windowId]) => windowId);
+    await this.logger.info("anchor_verification_sampled", {
+      sampleCount: samples.length,
+      spanMs: after.observedAt - (samples[0]?.observedAt ?? after.observedAt),
+      verdicts: classification.verdicts,
+    });
     const result: AnchorRunResult = {
       status: verified ? "verified" : "unverified",
       detail: verified
         ? `The isolated ${formatAnchorRoute(route)} turn advanced ${verifiedWindowIds.length} of ${effectiveTargetWindowIds.length} target window reset timestamps.`
-        : "The turn completed, but the target window timestamp could not be verified as advanced.",
+        : slidingWindowIds.length > 0
+          ? `The turn completed, but ${slidingWindowIds.length} target window reset timestamp kept sliding with wall-clock time across ${samples.length} samples, so it was not anchored by this turn.`
+          : "The turn completed, but the target window timestamp could not be verified as advanced.",
       before,
       after,
       threadId: thread.id,
@@ -277,6 +300,7 @@ export class AnchorExecutor {
       targetWindowIds: effectiveTargetWindowIds,
       turnCompletedSafely: true,
       verifiedWindowIds,
+      verificationVerdicts: classification.verdicts,
     };
     await this.logger.info("anchor_completed", {
       status: result.status,
@@ -298,6 +322,36 @@ export class AnchorExecutor {
       });
     }
     return result;
+  }
+
+  /**
+   * Read the rate limits several times after the turn so a window whose
+   * timestamp merely tracks the clock can be told apart from one this turn
+   * actually anchored. A read that fails after at least one sample stops the
+   * series rather than aborting: fewer samples degrade to a non-verified
+   * verdict, which is the safe direction. The first read still throws, since
+   * that leaves nothing to classify.
+   */
+  private async sampleAfterTurn(): Promise<NormalizedSnapshot[]> {
+    await delay(this.config.verificationDelaySeconds * 1_000);
+    const samples: NormalizedSnapshot[] = [];
+    const configured = this.config.verificationSampleCount;
+    const count = Number.isFinite(configured) ? Math.max(1, Math.trunc(configured)) : 1;
+    for (let index = 0; index < count; index += 1) {
+      if (index > 0) {
+        await delay(this.config.verificationSampleIntervalSeconds * 1_000);
+      }
+      try {
+        samples.push(normalizeRateLimits(await this.client.readRateLimits()));
+      } catch (error: unknown) {
+        if (samples.length === 0) {
+          throw error;
+        }
+        await this.logger.warn("anchor_verification_sample_failed", { sampleIndex: index });
+        break;
+      }
+    }
+    return samples;
   }
 
   private async reportTurnCompleted(handler: AnchorTurnCompletedHandler | undefined, event: AnchorTurnCompleted): Promise<void> {
@@ -326,6 +380,105 @@ export class AnchorExecutor {
       });
     }
   }
+}
+
+/**
+ * Reset timestamps within this many seconds of each other count as unchanged.
+ * Measured against the live backend: an anchored window's timestamp jitters by
+ * about a second between reads, so a zero-tolerance comparison would misread a
+ * correctly anchored window as unstable.
+ */
+const RESET_STABILITY_TOLERANCE_SECONDS = 1;
+
+/**
+ * Fraction of the intended sampling span that must actually have elapsed
+ * before identical timestamps count as proof of steadiness.
+ *
+ * Steadiness is only meaningful over a span longer than the backend's own
+ * refresh granularity: if every sample came from one cached snapshot,
+ * identical values prove nothing. That assumption cannot be eliminated from
+ * outside -- any span can be defeated by a coarser cache -- so it is bounded
+ * two ways instead. The configured span is pinned in loadConfig, and this
+ * check confirms the samples really were spread across it rather than taken
+ * back to back. The observed span is logged as spanMs so a verdict stays
+ * auditable after the fact.
+ */
+const MIN_STABILITY_SPAN_FRACTION = 0.6;
+
+export function minimumStabilitySpanMs(config: Pick<ManagerConfig, "verificationSampleCount" | "verificationSampleIntervalSeconds">): number {
+  const gaps = Math.max(0, Math.trunc(config.verificationSampleCount) - 1);
+  return gaps * config.verificationSampleIntervalSeconds * 1_000 * MIN_STABILITY_SPAN_FRACTION;
+}
+
+/**
+ * Decide, per target window, whether the post-turn samples show a window this
+ * turn anchored.
+ *
+ * The distinction that matters: an anchored window has a fixed reset
+ * timestamp, so repeated reads return the same value. An uninitialized window
+ * can report `now + duration`, recomputed per read, so its timestamp advances
+ * by roughly the elapsed wall-clock time. Comparing the timestamp's drift
+ * against elapsed time separates the two; comparing a single "after" against
+ * "before" cannot, because the clock alone satisfies it.
+ *
+ * Only `advanced_stable` verifies. Because stability is judged from the
+ * samples' own timestamps, a local clock jump can only push a window into
+ * `sliding` or `indeterminate` -- both non-verified.
+ */
+export function classifyVerificationSamples(
+  before: NormalizedSnapshot,
+  samples: NormalizedSnapshot[],
+  targetWindowIds?: string[],
+  now = Date.now(),
+  minSpanMs = 0,
+): { verdicts: Record<string, AnchorWindowVerdict>; verifiedWindowIds: string[] } {
+  const targets = targetWindowIds
+    ?? before.windows.filter((window) => window.kind !== "unknown").map((window) => window.id);
+  const verdicts: Record<string, AnchorWindowVerdict> = {};
+  const verifiedWindowIds: string[] = [];
+  const last = samples[samples.length - 1];
+
+  for (const windowId of targets) {
+    const series: number[] = [];
+    let complete = true;
+    for (const sample of samples) {
+      const window = sample.windows.find((candidate) => candidate.id === windowId);
+      if (window === undefined || window.kind === "unknown" || window.resetsAt === null) {
+        complete = false;
+        break;
+      }
+      series.push(window.resetsAt);
+    }
+    if (!complete || series.length < 2 || last === undefined) {
+      verdicts[windowId] = "indeterminate";
+      continue;
+    }
+
+    const spanMs = last.observedAt - samples[0]!.observedAt;
+    const spread = Math.max(...series) - Math.min(...series);
+    if (spread <= RESET_STABILITY_TOLERANCE_SECONDS) {
+      if (spanMs < minSpanMs) {
+        // Identical values across too short a window are not evidence of a
+        // fixed timestamp; they are equally consistent with one cached read.
+        verdicts[windowId] = "indeterminate";
+        continue;
+      }
+      const advanced = advancedTargetResetWindowIds(before, last, [windowId], now).includes(windowId);
+      verdicts[windowId] = advanced ? "advanced_stable" : "not_advanced";
+      if (advanced) {
+        verifiedWindowIds.push(windowId);
+      }
+      continue;
+    }
+
+    const elapsedSeconds = spanMs / 1_000;
+    const monotonic = series.every((value, index) => index === 0 || value >= series[index - 1]!);
+    verdicts[windowId] = monotonic && elapsedSeconds > 0 && spread >= elapsedSeconds * 0.5
+      ? "sliding"
+      : "indeterminate";
+  }
+
+  return { verdicts, verifiedWindowIds };
 }
 
 export function advancedTargetResetWindowIds(

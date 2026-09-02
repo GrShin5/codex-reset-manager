@@ -2,7 +2,8 @@
 
 import { AppServerClient, formatAnchorRoute, selectLowestCostAnchorRoute } from "./app-server.js";
 import { AnchorExecutor } from "./anchor.js";
-import { resolveAppServerCommand, resolveCodexExecutable } from "./codex-command.js";
+import { codexVersionDiagnostic, readCodexCliVersion, resolveAppServerCommand, resolveCodexExecutable } from "./codex-command.js";
+import { readMcpServerNames, resolveCodexConfigPath } from "./codex-config.js";
 import { anchorWorkspaceIsEmpty, ensureAppDirectories, loadConfig, loadState, saveState, tailFile } from "./files.js";
 import { installLaunchAgent, launchAgentInstalled, launchAgentRegistered, uninstallLaunchAgent } from "./launch-agent.js";
 import { Logger } from "./logger.js";
@@ -18,6 +19,7 @@ import {
   recordManualAnchor,
   snapshotContainsTargetWindow,
 } from "./state-machine.js";
+import type { AnchorWindowVerdict } from "./types.js";
 import { formatWindow, isTargetWindowExposed, normalizeRateLimits } from "./windows.js";
 
 const usage = `Usage: codex-reset-manager <command>
@@ -29,7 +31,12 @@ Commands:
   status | logs
   enable | disable
   verify-monitoring-cost [--reads=N]
+  verify-protocol [--stability-seconds=N] [--allow-thread-start]
   test-anchor --confirm-consume-usage
+
+verify-protocol checks this client against the installed Codex CLI. It starts
+no model turn. --allow-thread-start additionally creates one ephemeral thread,
+which may initialize configured MCP servers.
 `;
 
 async function main(): Promise<void> {
@@ -47,7 +54,7 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "doctor":
-      await doctor(paths, logger);
+      await doctor(paths, config, logger);
       return;
     case "install":
       await install(paths, logger);
@@ -73,6 +80,9 @@ async function main(): Promise<void> {
     case "verify-monitoring-cost":
       await verifyMonitoringCost(paths, logger, parseReads(argumentsList));
       return;
+    case "verify-protocol":
+      await verifyProtocol(paths, logger, argumentsList);
+      return;
     case "test-anchor":
       await testAnchor(paths, config, logger, argumentsList);
       return;
@@ -83,6 +93,7 @@ async function main(): Promise<void> {
 
 async function doctor(
   paths: ReturnType<typeof resolveAppPaths>,
+  config: Awaited<ReturnType<typeof loadConfig>>,
   logger: Logger,
 ): Promise<void> {
   const codexExecutable = await requireCodexExecutable();
@@ -96,6 +107,11 @@ async function doctor(
     ]);
     const snapshot = normalizeRateLimits(rateLimits);
     const route = selectLowestCostAnchorRoute(models);
+    const codexConfigPath = resolveCodexConfigPath();
+    const [codexVersion, mcpServers] = await Promise.all([
+      readCodexCliVersion(codexExecutable),
+      readMcpServerNames(codexConfigPath),
+    ]);
     const workspaceEmpty = await anchorWorkspaceIsEmpty(paths);
     const ephemeral = route !== null && workspaceEmpty ? await client.startEphemeralThread(paths.anchorWorkspace, route) : null;
     const ephemeralValid = route !== null
@@ -108,6 +124,11 @@ async function doctor(
     console.log("Codex Reset Manager doctor");
     console.log(`  App Server: connected`);
     console.log(`  Codex CLI executable: ${codexExecutable}`);
+    console.log(`  Codex CLI version: ${codexVersionDiagnostic(codexVersion)}`);
+    console.log(`  MCP servers in ${codexConfigPath}: ${mcpServerDiagnostic(mcpServers)}`);
+    // config.json is not rewritten for existing installs, so print the values
+    // actually in force rather than making the operator infer them.
+    console.log(`  Anchor verification: ${config.verificationSampleCount} samples every ${config.verificationSampleIntervalSeconds}s after a ${config.verificationDelaySeconds}s delay`);
     console.log(`  ChatGPT authentication: ${account.requiresOpenaiAuth === false ? "not required by current provider" : account.account?.type ?? "unknown"}`);
     console.log(`  Lowest-cost eligible anchor route: ${route === null ? "unavailable (no known model with an advertised safe effort)" : formatAnchorRoute(route)}`);
     console.log(`  Dedicated anchor workspace: ${workspaceEmpty ? "empty" : "not empty (anchor blocked)"}`);
@@ -194,6 +215,12 @@ async function status(
   console.log(`  Manual reset advancement: ${manualResetText(state.manualAnchor)}`);
   console.log(`  Manual anchor route: ${state.manualAnchor === null ? "not run" : state.manualAnchor.route === undefined || state.manualAnchor.route === null ? "not recorded (legacy result)" : formatAnchorRoute(state.manualAnchor.route)}`);
   console.log(`  Manual adopted baselines: ${state.manualAnchor?.baselineWindowIds?.length ? state.manualAnchor.baselineWindowIds.join(", ") : "none"}`);
+  // A refused window is simply absent from the adopted list, which reads as if
+  // it were never a target. Name it instead.
+  const statusRefused = state.manualAnchor?.refusedWindowIds ?? [];
+  if (statusRefused.length > 0) {
+    console.log(`  Manual refused baselines: ${statusRefused.join(", ")} (not proven steady; these are not scheduled)`);
+  }
   const eligibility = state.autoAnchorEnabled
     ? `Automatic anchor scheduling eligible: ${manualAnchorAllowsAutoAnchoring(state) ? "yes" : "no"}`
     : `Enable can be run now: ${manualAnchorAllowsEnable(state) ? "yes" : "no"}`;
@@ -282,6 +309,164 @@ async function verifyMonitoringCost(paths: ReturnType<typeof resolveAppPaths>, l
   }
 }
 
+/**
+ * Checks the wire contract against the real Codex CLI, which unit tests cannot
+ * do: their fake server is only ever as correct as our belief about the
+ * protocol. GitHub Actions cannot authenticate a Codex account, so this is a
+ * local, explicitly-invoked command rather than a CI job.
+ *
+ * It starts no model turn and consumes no usage beyond the passive reads the
+ * daemon already performs on every poll.
+ */
+async function verifyProtocol(
+  paths: ReturnType<typeof resolveAppPaths>,
+  logger: Logger,
+  argumentsList: string[],
+): Promise<void> {
+  const allowThreadStart = argumentsList.includes("--allow-thread-start");
+  const stabilitySeconds = parseStabilitySeconds(argumentsList);
+  const codexExecutable = await requireCodexExecutable();
+  const client = new AppServerClient(logger, codexExecutable);
+  let failures = 0;
+  const fail = (message: string): void => {
+    failures += 1;
+    console.log(`  FAIL ${message}`);
+  };
+  try {
+    console.log("Codex Reset Manager protocol verification (no model turn)");
+    console.log(`  Codex CLI executable: ${codexExecutable}`);
+    console.log(`  Codex CLI version: ${codexVersionDiagnostic(await readCodexCliVersion(codexExecutable))}`);
+
+    await client.start();
+    console.log("  initialize: ok");
+    console.log("  initialized: sent");
+    const initialize = client.getInitializeResult();
+    if (isRecord(initialize)) {
+      for (const key of ["userAgent", "platformOs", "platformFamily", "codexHome"]) {
+        if (initialize[key] !== undefined) {
+          console.log(`    ${key}: ${String(initialize[key])}`);
+        }
+      }
+    }
+
+    const account = await client.getAccount();
+    console.log(`  account/read: ${account.requiresOpenaiAuth === false ? "no ChatGPT auth required" : account.account?.type ?? "unknown"}`);
+
+    const models = await client.listModels();
+    const route = selectLowestCostAnchorRoute(models);
+    console.log(`  model/list: ${models.length} model(s)`);
+    console.log(`  lowest-cost eligible anchor route: ${route === null ? "unavailable" : formatAnchorRoute(route)}`);
+
+    const first = normalizeRateLimits(await client.readRateLimits());
+    console.log(`  account/rateLimits/read: ${first.windows.length} window(s)`);
+    first.windows.forEach((window) => console.log(`    ${formatWindow(window)}`));
+
+    if (stabilitySeconds > 0) {
+      // A window whose reset timestamp slides with wall-clock time is not
+      // anchored, however much the timestamp "advances". Measuring the two
+      // deltas side by side is what distinguishes the two cases.
+      console.log(`  reset-timestamp stability over ${stabilitySeconds}s:`);
+      await delay(stabilitySeconds * 1_000);
+      const second = normalizeRateLimits(await client.readRateLimits());
+      const elapsedSeconds = (second.observedAt - first.observedAt) / 1_000;
+      for (const after of second.windows) {
+        const before = first.windows.find((window) => window.id === after.id);
+        if (before?.resetsAt === undefined || before.resetsAt === null || after.resetsAt === null) {
+          console.log(`    ${after.id}: indeterminate (no reset timestamp)`);
+          continue;
+        }
+        const drift = after.resetsAt - before.resetsAt;
+        const label = Math.abs(drift) <= 1
+          ? "stable (anchored)"
+          : drift >= elapsedSeconds * 0.5
+            ? "SLIDING with the clock (not anchored)"
+            : "indeterminate";
+        console.log(`    ${after.id}: reset moved ${drift}s over ${elapsedSeconds.toFixed(1)}s elapsed — ${label}`);
+      }
+    }
+
+    if (allowThreadStart) {
+      if (route === null) {
+        fail("thread/start skipped: no eligible anchor route");
+      } else if (!await anchorWorkspaceIsEmpty(paths)) {
+        fail("thread/start skipped: the dedicated anchor workspace is not empty");
+      } else {
+        console.log("  starting one ephemeral thread; configured MCP servers may initialize now");
+        const thread = await client.startEphemeralThread(paths.anchorWorkspace, route);
+        const valid = thread.ephemeral === true
+          && thread.path === null
+          && typeof thread.id === "string"
+          && thread.id.length > 0
+          && thread.model === route.model
+          && thread.reasoningEffort === route.effort;
+        console.log(`  thread/start: ${valid ? "ephemeral thread confirmed" : "NOT confirmed"}`);
+        if (!valid) {
+          fail("the ephemeral thread response did not match the requested route");
+        }
+      }
+    } else {
+      console.log("  thread/start: skipped (pass --allow-thread-start to include it)");
+    }
+
+    // The client cannot match an error reply that carries no id to the message
+    // that caused it, so a rejected `initialized` would otherwise be invisible.
+    const unmatched = client.takeUnmatchedErrors();
+    if (unmatched.length === 0) {
+      console.log("  unmatched error responses: none");
+    } else {
+      // These cannot be attributed to a specific request -- a late reply to a
+      // timed-out call lands here too -- so report them as something to read,
+      // not as a diagnosis. A rejected `initialized` would appear here.
+      for (const error of unmatched) {
+        fail(`server returned an error that matches no pending request (code ${error.code}): ${error.message}`);
+      }
+      console.log("    An error here may be a rejected notification, or a late reply to a timed-out request.");
+    }
+
+    console.log(`  turn/start issued: no`);
+    console.log(failures === 0 ? "Protocol verification passed." : `Protocol verification found ${failures} problem(s).`);
+  } finally {
+    await client.stop();
+  }
+  if (failures > 0) {
+    process.exitCode = 1;
+  }
+}
+
+function parseStabilitySeconds(argumentsList: string[]): number {
+  const flag = argumentsList.find((entry) => entry.startsWith("--stability-seconds="));
+  if (flag === undefined) {
+    return 0;
+  }
+  const parsed = Number.parseInt(flag.slice("--stability-seconds=".length), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.min(parsed, 120);
+}
+
+/** Plain-language rendering of a sampling verdict for the operator. */
+function verdictText(verdict: AnchorWindowVerdict): string {
+  switch (verdict) {
+    case "advanced_stable":
+      return "advanced and then held steady (anchored)";
+    case "sliding":
+      return "kept moving with the clock (NOT anchored; this window is not usable as a baseline)";
+    case "not_advanced":
+      return "held steady but never advanced";
+    default:
+      return "could not be determined from the samples taken";
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
 async function testAnchor(
   paths: ReturnType<typeof resolveAppPaths>,
   config: Awaited<ReturnType<typeof loadConfig>>,
@@ -302,8 +487,21 @@ async function testAnchor(
     console.log(`  Result: ${manual.status}`);
     console.log(`  Safety and route validation: ${result.turnCompletedSafely ? "passed" : "not passed"}`);
     console.log(`  Reset timestamp advancement: ${manualResetText(manual)}`);
+    const verdicts = Object.entries(result.verificationVerdicts ?? {});
+    if (verdicts.length > 0) {
+      console.log("  Reset timestamp sampling:");
+      for (const [windowId, verdict] of verdicts) {
+        console.log(`    ${windowId}: ${verdictText(verdict)}`);
+      }
+    }
     const baselines = manual.baselineWindowIds ?? [];
     console.log(`  Adopted anchor baselines: ${baselines.length > 0 ? baselines.join(", ") : "none"}`);
+    const refused = manual.refusedWindowIds ?? [];
+    if (refused.length > 0) {
+      console.log(`  Refused as baselines: ${refused.join(", ")}`);
+      console.log("    These windows were not proven steady, so they will not be scheduled.");
+      console.log("    Re-run test-anchor to try again, or run verify-protocol --stability-seconds=60 to see how they behave.");
+    }
     console.log(`  Automatic anchoring can be enabled: ${manualAnchorAllowsEnable(state) ? "yes" : "no"}`);
     console.log(`  Selected route: ${result.route === null ? "not selected" : formatAnchorRoute(result.route)}`);
     console.log(`  Detail: ${result.detail}`);
@@ -385,3 +583,23 @@ void main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : "Unexpected failure.");
   process.exitCode = 1;
 });
+
+/**
+ * Starting a thread can initialize the user's configured MCP servers, and both
+ * doctor's ephemeral check and a real anchor start one. The anchor prompt
+ * forbids tools and any tool-like item aborts the turn, but server startup
+ * itself happens earlier than that, so it is worth stating plainly.
+ *
+ * Server names are printed for the operator only; they are never logged.
+ */
+function mcpServerDiagnostic(names: string[] | null): string {
+  if (names === null) {
+    return "config.toml not readable";
+  }
+  if (names.length === 0) {
+    return "none configured";
+  }
+  return `${names.length} configured (${names.join(", ")}). Starting a thread — an anchor, `
+    + "or doctor's own ephemeral check when a route is available and the workspace is empty — "
+    + "may initialize these servers.";
+}

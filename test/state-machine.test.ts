@@ -63,6 +63,13 @@ function completedResult(
     targetWindowIds: before.windows.filter((window) => window.kind !== "unknown").map((window) => window.id),
     turnCompletedSafely: status === "verified" || status === "unverified",
     verifiedWindowIds: status === "verified" ? before.windows.filter((window) => window.kind !== "unknown").map((window) => window.id) : [],
+    // Production always sets verdicts alongside turnCompletedSafely, so a
+    // fixture that omits them would not describe any reachable state.
+    verificationVerdicts: Object.fromEntries(
+      before.windows
+        .filter((window) => window.kind !== "unknown")
+        .map((window) => [window.id, status === "verified" ? "advanced_stable" : "not_advanced"] as const),
+    ),
   };
 }
 
@@ -240,4 +247,96 @@ test("unknown windows remain permanently ineligible", () => {
   const unknown = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 1_440, resetsAt: 1_000 }), BEFORE_BOUNDARY_MS).windows[0]!;
   state.windows[unknown.id] = { ...unknown, observedAt: BEFORE_BOUNDARY_MS, verifiedResetAt: 1_000, lastAnchorGeneration: "manual" };
   assert.deepEqual(observeSnapshot(state, normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 1_440, resetsAt: 87_400 }), AFTER_BOUNDARY_MS), DEFAULT_CONFIG), []);
+});
+
+/**
+ * A window whose reset timestamp tracks the clock is not a boundary, so it
+ * must not become a scheduling baseline. Relabelling the evidence would not
+ * have been enough: hasStoredBaseline gates on verifiedResetAt and never reads
+ * baselineEvidence, so the adoption itself has to be refused.
+ */
+test("a manual anchor does not adopt a sliding window as a scheduling baseline", () => {
+  const state = emptyState();
+  const before = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS }), 100);
+  // The timestamp is later than before -- the old check would have accepted it.
+  const after = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS + 18_000 }), 200);
+  const windowId = after.windows[0]!.id;
+  const manual = recordManualAnchor(state, {
+    ...safeCompletedStableResult(before, after),
+    verificationVerdicts: { [windowId]: "sliding" },
+  });
+
+  assert.equal(state.windows[windowId], undefined, "no baseline may be stored for a sliding window");
+  assert.notEqual(manual.status, "ready");
+  assert.equal(manualAnchorAllowsAutoAnchoring(state), false);
+  assert.equal(manualAnchorAllowsEnable(state, 200), false, "automation must stay closed");
+});
+
+/** The same run, without the sliding verdict, still adopts its baseline. */
+test("a manual anchor still adopts a baseline when no window was sliding", () => {
+  const state = emptyState();
+  const before = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS }), 100);
+  const after = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS + 18_000 }), 200);
+  const windowId = after.windows[0]!.id;
+  const manual = recordManualAnchor(state, {
+    ...safeCompletedStableResult(before, after),
+    verificationVerdicts: { [windowId]: "not_advanced" },
+  });
+
+  assert.equal(manual.status, "ready");
+  assert.equal(state.windows[windowId]?.verifiedResetAt, BASELINE_SECONDS + 18_000);
+  // The turn was not verified, so the evidence must not claim it was.
+  assert.equal(state.windows[windowId]?.baselineEvidence, "manual_ready");
+  assert.equal(manualAnchorAllowsEnable(state, 200), true);
+});
+
+/**
+ * The hole a deny-list left open. A genuinely sliding window lands on
+ * "indeterminate" whenever the series is non-monotonic or the drift does not
+ * clear the elapsed-time threshold, so refusing only "sliding" would still
+ * adopt a moving target as a scheduling baseline -- and the monitor would then
+ * wait forever for a boundary that keeps receding.
+ */
+test("a manual anchor refuses an indeterminate window as a scheduling baseline", () => {
+  const state = emptyState();
+  const before = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS }), 100);
+  const after = normalizeRateLimits(rateLimits({ usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS + 18_000 }), 200);
+  const windowId = after.windows[0]!.id;
+  const manual = recordManualAnchor(state, {
+    ...safeCompletedStableResult(before, after),
+    verificationVerdicts: { [windowId]: "indeterminate" },
+  });
+
+  assert.equal(state.windows[windowId], undefined, "an unproven window must not become a baseline");
+  assert.notEqual(manual.status, "ready");
+  assert.equal(manualAnchorAllowsEnable(state, 200), false);
+  assert.deepEqual(manual.refusedWindowIds, [windowId], "the refusal must be visible to the operator");
+});
+
+test("a manual anchor records every refused window so status can explain the gap", () => {
+  const state = emptyState();
+  const before = normalizeRateLimits(
+    rateLimits(
+      { usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS },
+      { usedPercent: 0, duration: 10_080, resetsAt: BASELINE_SECONDS },
+    ),
+    100,
+  );
+  const after = normalizeRateLimits(
+    rateLimits(
+      { usedPercent: 0, duration: 300, resetsAt: BASELINE_SECONDS + 18_000 },
+      { usedPercent: 0, duration: 10_080, resetsAt: BASELINE_SECONDS + 604_800 },
+    ),
+    200,
+  );
+  const fiveHour = after.windows.find((window) => window.kind === "five_hour")!.id;
+  const weekly = after.windows.find((window) => window.kind === "weekly")!.id;
+  const manual = recordManualAnchor(state, {
+    ...safeCompletedStableResult(before, after),
+    verificationVerdicts: { [fiveHour]: "not_advanced", [weekly]: "sliding" },
+  });
+
+  assert.deepEqual(manual.baselineWindowIds, [fiveHour]);
+  assert.deepEqual(manual.refusedWindowIds, [weekly]);
+  assert.equal(manual.status, "ready", "one good window still enables scheduling");
 });

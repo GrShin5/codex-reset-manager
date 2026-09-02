@@ -180,6 +180,7 @@ enabling automatic anchors.
 node dist/src/cli.js status
 node dist/src/cli.js logs
 node dist/src/cli.js verify-monitoring-cost --reads=20
+node dist/src/cli.js verify-protocol
 launchctl print gui/$(id -u)/com.codex-reset-manager
 ~~~
 
@@ -216,6 +217,14 @@ Use the results as follows:
 - <code>verify-monitoring-cost</code> compares snapshots before and after
   passive reads. It demonstrates this client path starts no model turn; it
   does not claim a zero backend-cost guarantee.
+- <code>verify-protocol</code> checks this client against the installed Codex
+  CLI: the handshake, <code>account/read</code>, <code>model/list</code>, and
+  <code>account/rateLimits/read</code>. It starts no model turn. Add
+  <code>--stability-seconds=N</code> to see whether a window's reset timestamp
+  holds steady or slides with the clock, and
+  <code>--allow-thread-start</code> to include one ephemeral thread, which may
+  initialize configured MCP servers. Unit tests can only be as correct as our
+  belief about the wire protocol, so run this after a Codex upgrade.
 - <code>launchctl print</code> confirms whether the loaded LaunchAgent is
   actually running. It should also show the
   <code>CODEX_RESET_MANAGER_CODEX</code> environment entry containing the

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { DEFAULT_CONFIG, emptyState } from "./types.js";
@@ -8,10 +8,67 @@ import { migrateLegacyRolloverState } from "./state-machine.js";
 
 export async function ensureAppDirectories(paths: AppPaths): Promise<void> {
   await Promise.all([
-    mkdir(paths.root, { recursive: true }),
-    mkdir(paths.logsDirectory, { recursive: true }),
-    mkdir(paths.anchorWorkspace, { recursive: true }),
+    mkdir(paths.root, { recursive: true, mode: 0o700 }),
+    mkdir(paths.logsDirectory, { recursive: true, mode: 0o700 }),
+    mkdir(paths.anchorWorkspace, { recursive: true, mode: 0o700 }),
   ]);
+  await tightenAppPermissions(paths);
+}
+
+/**
+ * `mode` on mkdir/appendFile only applies at creation, so an installation
+ * created before those modes were set keeps its original permissions forever.
+ * Tighten those once, best effort.  Every step is swallowed: these are
+ * owner-only operations on the owner's own files, and a failure must never
+ * stop a CLI command or prevent the daemon from starting.
+ */
+async function tightenAppPermissions(paths: AppPaths): Promise<void> {
+  for (const directory of [paths.root, paths.logsDirectory, paths.anchorWorkspace]) {
+    await tighten(directory, 0o700);
+  }
+  try {
+    const entries = await readdir(paths.logsDirectory);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.startsWith("events.") && entry.endsWith(".jsonl"))
+        .map(async (entry) => tighten(join(paths.logsDirectory, entry), 0o600)),
+    );
+  } catch {
+    // A missing logs directory is normal before the first run.
+  }
+  await Promise.all([paths.stdoutLog, paths.stderrLog].map(async (file) => tighten(file, 0o600)));
+}
+
+/**
+ * Tighten one path we own, and only one we own.
+ *
+ * CODEX_ANCHOR_HOME is arbitrary user-supplied input, so this must never be a
+ * primitive for relaxing or narrowing arbitrary files. Two guards matter:
+ *
+ * - lstat, and refuse symlinks. chmod follows links, so a symlink planted as
+ *   `events.x.jsonl` in a writable logs directory would otherwise have its
+ *   target chmod'ed.
+ * - refuse anything this user does not own, so pointing the home at a shared
+ *   directory cannot lock other accounts out of it.
+ */
+async function tighten(path: string, mode: number): Promise<void> {
+  try {
+    const current = await lstat(path);
+    if (current.isSymbolicLink()) {
+      return;
+    }
+    if ((current.mode & 0o077) === 0) {
+      return;
+    }
+    const uid = process.getuid?.();
+    if (uid !== undefined && current.uid !== uid) {
+      return;
+    }
+    await chmod(path, mode);
+  } catch {
+    // Missing paths are normal before the first run; anything else is not
+    // ours to repair.
+  }
 }
 
 /**
@@ -19,7 +76,7 @@ export async function ensureAppDirectories(paths: AppPaths): Promise<void> {
  * directory automatically: if something appears in it, fail closed instead.
  */
 export async function anchorWorkspaceIsEmpty(paths: AppPaths): Promise<boolean> {
-  await mkdir(paths.anchorWorkspace, { recursive: true });
+  await mkdir(paths.anchorWorkspace, { recursive: true, mode: 0o700 });
   return (await readdir(paths.anchorWorkspace)).length === 0;
 }
 
@@ -64,6 +121,10 @@ export async function loadConfig(paths: AppPaths): Promise<ManagerConfig> {
     resetGraceSeconds: DEFAULT_CONFIG.resetGraceSeconds,
     coalesceSeconds: DEFAULT_CONFIG.coalesceSeconds,
     verificationDelaySeconds: DEFAULT_CONFIG.verificationDelaySeconds,
+    // Weakening verification is precisely how a sliding reset timestamp would
+    // be mistaken for a successful anchor, so these are pinned like the rest.
+    verificationSampleCount: DEFAULT_CONFIG.verificationSampleCount,
+    verificationSampleIntervalSeconds: DEFAULT_CONFIG.verificationSampleIntervalSeconds,
     rollbackThresholdPercent: DEFAULT_CONFIG.rollbackThresholdPercent,
     logFileMaxBytes: DEFAULT_CONFIG.logFileMaxBytes,
     logFilesToKeep: DEFAULT_CONFIG.logFilesToKeep,
